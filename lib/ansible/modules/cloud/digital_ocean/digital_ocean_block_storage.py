@@ -130,19 +130,7 @@ class DOBlockStorage(object):
         return v
 
     def poll_action_for_complete_status(self, action_id):
-        url = 'actions/{}'.format(action_id)
-        end_time = time.time() + self.module.params['timeout']
-        while time.time() < end_time:
-            time.sleep(2)
-            response = self.rest.get(url)
-            status = response.status_code
-            json = response.json
-            if status == 200:
-                if json['action']['status'] == 'completed':
-                    return True
-                elif json['action']['status'] == 'errored':
-                    raise DOBlockStorageException(json['message'])
-        raise DOBlockStorageException('Unable to reach api.digitalocean.com')
+
 
     def get_attached_droplet_ID(self, volume_name, region):
         url = 'volumes?name={}&region={}'.format(volume_name, region)
@@ -170,7 +158,7 @@ class DOBlockStorage(object):
         status = response.status_code
         json = response.json
         if status == 202:
-            return self.poll_action_for_complete_status(json['action']['id'])
+            return self.rest.poll_action_for_status(json['action']['id'], status='completed')
         elif status == 200:
             return True
         elif status == 422:

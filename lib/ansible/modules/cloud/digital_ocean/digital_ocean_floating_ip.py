@@ -114,182 +114,100 @@ data:
     }
 '''
 
-import json
 import time
 
 from ansible.module_utils.basic import AnsibleModule
 from ansible.module_utils.basic import env_fallback
-from ansible.module_utils.urls import fetch_url
+from ansible.module_utils.digital_ocean import DigitalOceanHelper
 
 
-class Response(object):
-
-    def __init__(self, resp, info):
-        self.body = None
-        if resp:
-            self.body = resp.read()
-        self.info = info
-
-    @property
-    def json(self):
-        if not self.body:
-            if "body" in self.info:
-                return json.loads(self.info["body"])
-            return None
-        try:
-            return json.loads(self.body)
-        except ValueError:
-            return None
-
-    @property
-    def status_code(self):
-        return self.info["status"]
-
-
-class Rest(object):
-
-    def __init__(self, module, headers):
+class DOFloatingIP(object):
+    def __init__(self, module):
         self.module = module
-        self.headers = headers
-        self.baseurl = 'https://api.digitalocean.com/v2'
+        self.rest = DigitalOceanHelper(module)
 
-    def _url_builder(self, path):
-        if path[0] == '/':
-            path = path[1:]
-        return '%s/%s' % (self.baseurl, path)
+    def create(self):
+        payload = {}
+        if self.module.params['region'] is not None:
+            payload["region"] = self.module.params['region']
+        if self.module.params['droplet_id'] is not None:
+            payload["droplet_id"] = self.module.params['droplet_id']
 
-    def send(self, method, path, data=None, headers=None):
-        url = self._url_builder(path)
-        data = self.module.jsonify(data)
-        timeout = self.module.params['timeout']
-
-        resp, info = fetch_url(self.module, url, data=data, headers=self.headers, method=method, timeout=timeout)
-
-        # Exceptions in fetch_url may result in a status -1, the ensures a
-        if info['status'] == -1:
-            self.module.fail_json(msg=info['msg'])
-
-        return Response(resp, info)
-
-    def get(self, path, data=None, headers=None):
-        return self.send('GET', path, data, headers)
-
-    def put(self, path, data=None, headers=None):
-        return self.send('PUT', path, data, headers)
-
-    def post(self, path, data=None, headers=None):
-        return self.send('POST', path, data, headers)
-
-    def delete(self, path, data=None, headers=None):
-        return self.send('DELETE', path, data, headers)
-
-
-def wait_action(module, rest, ip, action_id, timeout=10):
-    end_time = time.time() + 10
-    while time.time() < end_time:
-        response = rest.get('floating_ips/{0}/actions/{1}'.format(ip, action_id))
+        response = self.rest.post("floating_ips", data=payload)
         status_code = response.status_code
-        status = response.json['action']['status']
-        # TODO: check status_code == 200?
-        if status == 'completed':
-            return True
-        elif status == 'errored':
-            module.fail_json(msg='Floating ip action error [ip: {0}: action: {1}]'.format(
-                ip, action_id), data=json)
-
-    module.fail_json(msg='Floating ip action timeout [ip: {0}: action: {1}]'.format(
-        ip, action_id), data=json)
-
-
-def core(module):
-    api_token = module.params['oauth_token']
-    state = module.params['state']
-    ip = module.params['ip']
-    droplet_id = module.params['droplet_id']
-
-    rest = Rest(module, {'Authorization': 'Bearer {0}'.format(api_token),
-                         'Content-type': 'application/json'})
-
-    if state in ('present'):
-        if droplet_id is not None and module.params['ip'] is not None:
-            # Lets try to associate the ip to the specified droplet
-            associate_floating_ips(module, rest)
+        json_data = response.json
+        if status_code == 202:
+            self.module.exit_json(changed=True, data=json_data)
         else:
-            create_floating_ips(module, rest)
+            self.module.fail_json(msg="Error creating floating ip [{0}: {1}]".format(
+                status_code, json_data["message"]), region=self.module.params['region'])
 
-    elif state in ('absent'):
-        response = rest.delete("floating_ips/{0}".format(ip))
+    def delete(self):
+        ip = self.module.params['ip']
+        # TODO: test what happens for unassigned IP
+        # self.unassign()
+        response = self.rest.delete("floating_ips/{0}".format(ip))
         status_code = response.status_code
         json_data = response.json
         if status_code == 204:
-            module.exit_json(changed=True)
+            self.module.exit_json(changed=True)
         elif status_code == 404:
-            module.exit_json(changed=False)
+            self.module.exit_json(changed=False)
         else:
-            module.exit_json(changed=False, data=json_data)
+            self.module.exit_json(changed=False, data=json_data)
+
+    def retrieve(self):
+        ip = self.module.params['ip']
+        response = self.rest.get("floating_ips/{0}".format(ip))
+        status_code = response.status_code
+        json_data = response.json
+        if status_code == 200:
+            return json_data['floating_ip']
+        else:
+            self.module.fail_json(msg="Error retrieving floating ip [{0}: {1}]".format(
+                status_code, json_data["message"]))
+
+    def do_action(self, payload):
+        ip = self.module.params['ip']
+        response = self.rest.post("floating_ips/{0}/actions".format(ip), data=payload)
+        status_code = response.status_code
+        json_data = response.json
+        self.module.exit_json(msg='%s' % (status_code,))
+        if status_code == 201:
+            self.rest.poll_action_for_status(json_data['action']['id'], status='completed')
+            self.module.exit_json(changed=True, data=json_data)
+        else:
+            self.module.fail_json(msg="Error completing floating ip action [{0}: {1}]".format(
+                payload['type'], json_data["message"]))
+
+    def assign_to_droplet(self):
+        details = self.retrieve()
+        droplet = details['droplet']
+        if droplet is not None and str(droplet['id']) in [self.module.params['droplet_id']]:
+            self.module.exit_json(changed=False)
+        payload = {
+            "type": "assign",
+            "droplet_id": self.module.params['droplet_id']
+        }
+        self.do_action(payload)
+
+    def unassign(self):
+        payload = {
+            "type": "unassign"
+        }
+        self.do_action(payload)
 
 
-def get_floating_ip_details(module, rest):
-    ip = module.params['ip']
-
-    response = rest.get("floating_ips/{0}".format(ip))
-    status_code = response.status_code
-    json_data = response.json
-    if status_code == 200:
-        return json_data['floating_ip']
-    else:
-        module.fail_json(msg="Error assigning floating ip [{0}: {1}]".format(
-            status_code, json_data["message"]), region=module.params['region'])
-
-
-def assign_floating_id_to_droplet(module, rest):
-    ip = module.params['ip']
-
-    payload = {
-        "type": "assign",
-        "droplet_id": module.params['droplet_id'],
-    }
-
-    response = rest.post("floating_ips/{0}/actions".format(ip), data=payload)
-    status_code = response.status_code
-    json_data = response.json
-    if status_code == 201:
-        wait_action(module, rest, ip, json_data['action']['id'])
-
-        module.exit_json(changed=True, data=json_data)
-    else:
-        module.fail_json(msg="Error creating floating ip [{0}: {1}]".format(
-            status_code, json_data["message"]), region=module.params['region'])
-
-
-def associate_floating_ips(module, rest):
-    floating_ip = get_floating_ip_details(module, rest)
-    droplet = floating_ip['droplet']
-
-    # TODO: If already assigned to a droplet verify if is one of the specified as valid
-    if droplet is not None and str(droplet['id']) in [module.params['droplet_id']]:
-        module.exit_json(changed=False)
-    else:
-        assign_floating_id_to_droplet(module, rest)
-
-
-def create_floating_ips(module, rest):
-    payload = {
-    }
-
-    if module.params['region'] is not None:
-        payload["region"] = module.params['region']
-    if module.params['droplet_id'] is not None:
-        payload["droplet_id"] = module.params['droplet_id']
-
-    response = rest.post("floating_ips", data=payload)
-    status_code = response.status_code
-    json_data = response.json
-    if status_code == 202:
-        module.exit_json(changed=True, data=json_data)
-    else:
-        module.fail_json(msg="Error creating floating ip [{0}: {1}]".format(
-            status_code, json_data["message"]), region=module.params['region'])
+def core(module):
+    floating_ip = DOFloatingIP(module)
+    state = module.params['state']
+    if state == 'present':
+        if module.params['droplet_id'] is not None and module.params['ip'] is not None:
+            floating_ip.assign_to_droplet()
+        else:
+            floating_ip.create()
+    elif state == 'absent':
+        floating_ip.delete()
 
 
 def main():
