@@ -28,6 +28,7 @@
 
 import json
 import os
+import time
 from ansible.module_utils.urls import fetch_url
 from ansible.module_utils._text import to_text
 
@@ -99,3 +100,18 @@ class DigitalOceanHelper:
             os.environ.get('OAUTH_TOKEN')
         if self.oauth_token is None:
             self.module.fail_json(msg='Unable to load api key: oauth_token')
+
+    def poll_action_for_status(self, action_id):
+        url = 'actions/{}'.format(action_id)
+        end_time = time.time() + self.module.params['timeout']
+        while time.time() < end_time:
+            time.sleep(2)
+            response = self.get(url)
+            status = response.status_code
+            json_data = response.json
+            if status == 200:
+                if json_data['action']['status'] == status:
+                    return True
+                elif json_data['action']['status'] == 'errored':
+                    self.module.fail_json(msg='Action in errored status', data=json_data)
+        self.module.fail_json(msg='Unable to reach api.digitalocean.com')
